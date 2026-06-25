@@ -1,11 +1,7 @@
-// ============================================================================
-//  Weekly Monitor API — SINGLE-FILE bundle (no lib/ folder needed).
-//  Everything inlined: universe + scoring engine + providers + thesis + server.
-//  Deploy: just this one file + package.json. Start command: node server.js
-// ============================================================================
+// Weekly Monitor API — SINGLE-FILE bundle (no lib/ folder needed). Start: node server.js
 import http from 'node:http';
 
-/* ---------------------------- UNIVERSE ---------------------------- */
+/* UNIVERSE */
 // Categorized watchlist. Add/remove tickers here; the engine scores whatever's listed.
 // `lists` a ticker can appear in: own, deep, leaps, para.
 const UNIVERSE = [
@@ -26,7 +22,7 @@ const LISTS = ['own', 'deep', 'leaps', 'para'];
 const tickersFor = (list) => UNIVERSE.filter(u => u.lists.includes(list));
 const allTickers = () => [...new Set(UNIVERSE.map(u => u.ticker))];
 
-/* ------------------------- SCORING ENGINE ------------------------- */
+/* SCORING */
 // ============================================================================
 //  Weekly Monitor — SCORING ENGINE
 //  Deterministic. Every grade/signal is computed from data with stated inputs.
@@ -216,7 +212,7 @@ function scoreUniverse(rows, list) {
              .sort((a, b) => (b.composite ?? -1) - (a.composite ?? -1));
 }
 
-/* --------------------------- PROVIDERS ---------------------------- */
+/* PROVIDERS */
 // ============================================================================
 //  DATA PROVIDERS — normalize FMP + Finnhub into the shape the engine expects.
 //  Set MOCK=1 (or omit keys) to run on built-in sample data with no network.
@@ -282,7 +278,7 @@ async function fetchTicker(meta) {
   return out;
 }
 
-/* ---------------------------- THESIS ------------------------------ */
+/* THESIS */
 // ============================================================================
 //  THESIS WRITER — one terse line per name, grounded ONLY in the computed data.
 //  Uses one batched Claude call per refresh (cheap). Falls back to a
@@ -349,7 +345,65 @@ async function writeTheses(rows) {
   }
 }
 
-/* ----------------------------- SERVER ----------------------------- */
+/* MACRO */
+// ============================================================================
+//  MACRO WRITER — a fresh daily market read, written by Claude with live web
+//  search. Cached so it costs ~a few cents/day. Falls back to a dated
+//  placeholder if no ANTHROPIC_API_KEY.
+// ============================================================================
+
+const MACRO_MDL = process.env.MACRO_MODEL || 'claude-sonnet-4-6';
+function todayLabel() {
+  return new Date().toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+}
+function fallbackMacro() {
+  return {
+    source: 'fallback',
+    asof: todayLabel(),
+    regime: 'Live macro commentary is off. Set ANTHROPIC_API_KEY on the backend to get a daily written market read here. Your prices and grades still update from the data feed.',
+    tape: [], drivers: [], readthrough: '',
+  };
+}
+async function writeMacro() {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key || isMock()) return fallbackMacro();
+  const today = todayLabel();
+  const system =
+    'You are a market strategist writing the daily macro section of a personal stock dashboard. ' +
+    'Use web search to find TODAY\'s US market action and the day\'s key drivers, then return ONLY a JSON object ' +
+    '(no markdown, no preamble) with this exact shape: ' +
+    '{"asof": string, "regime": string (2-3 plain-English sentences on the current regime), ' +
+    '"tape": [{"label": string, "value": string, "tone": "green"|"rose"|"gold"}] (3-4 index/vol moves like S&P, Nasdaq, Russell 2000, VIX), ' +
+    '"drivers": [{"title": string, "stance": "Tailwind"|"Headwind"|"Watch", "note": string (1-2 sentences)}] (4-6 items spanning Fed/rates, inflation prints, major earnings, sector rotation, and geopolitics/oil as relevant), ' +
+    '"readthrough": string (2-3 sentences on what it means for a tech/AI-heavy watchlist)}. ' +
+    'Be concrete and current. No URLs, no hype, no advice verbs. asof must be "' + today + '".';
+  const body = {
+    model: MACRO_MDL, max_tokens: 1600, system,
+    messages: [{ role: 'user', content: 'Write today\'s macro section. Today is ' + today + '. Search for the latest US market action (S&P 500, Nasdaq, Russell 2000, VIX levels and direction), Fed/rate expectations, any inflation data this week, major earnings, sector rotation, and oil/geopolitics, then return the JSON.' }],
+    tools: [{ type: 'web_search_20250305', name: 'web_search', max_uses: 6 }],
+  };
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error('http ' + res.status);
+    const j = await res.json();
+    const text = (j.content || []).filter(b => b.type === 'text').map(b => b.text).join('').trim();
+    const m = text.match(/\{[\s\S]*\}/);
+    const obj = JSON.parse(m ? m[0] : text.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim());
+    obj.source = 'claude';
+    if (!obj.asof) obj.asof = today;
+    if (!Array.isArray(obj.tape)) obj.tape = [];
+    if (!Array.isArray(obj.drivers)) obj.drivers = [];
+    return obj;
+  } catch (e) {
+    const f = fallbackMacro(); f.error = String(e.message || e); return f;
+  }
+}
+
+/* SERVER */
 // ============================================================================
 //  Weekly Monitor API — zero-dependency Node server.
 //  Pulls live data, runs the scoring engine, serves clean JSON to the PWA.
@@ -360,12 +414,22 @@ async function writeTheses(rows) {
 
 
 
+
 const PORT = process.env.PORT || 8787;
 const TTL  = (+(process.env.CACHE_TTL_MIN || 10)) * 60 * 1000;
 const cache = new Map(); // key -> { ts, data }
 
 const fresh = (k) => { const c = cache.get(k); return c && (Date.now() - c.ts < TTL) ? c.data : null; };
 const put   = (k, data) => { cache.set(k, { ts: Date.now(), data }); return data; };
+
+const MACRO_TTL = (+(process.env.MACRO_TTL_MIN || 360)) * 60 * 1000; // default 6h
+async function buildMacro() {
+  const c = cache.get('macro');
+  if (c && (Date.now() - c.ts < MACRO_TTL)) return c.data;
+  const data = await writeMacro();
+  cache.set('macro', { ts: Date.now(), data });
+  return data;
+}
 
 // fetch every ticker once (throttled), score per list it belongs to
 async function buildAll() {
@@ -419,6 +483,7 @@ const server = http.createServer(async (req, res) => {
       signalRule: 'below 200-DMA -> CONFIRM (never "buy support" in a downtrend); at support + uptrend + not hot -> BUY; extended/overbought -> WAIT; thin data -> VERIFY',
     });
     if (url.pathname === '/api/monitor') return send(res, 200, await buildAll());
+    if (url.pathname === '/api/macro') return send(res, 200, await buildMacro());
     const mList = url.pathname.match(/^\/api\/list\/(\w+)$/);
     if (mList) { const all = await buildAll(); const l = mList[1]; return l in all.lists ? send(res, 200, { list: l, rows: all.lists[l], asof: all.asof }) : send(res, 404, { error: 'unknown list' }); }
     const mTk = url.pathname.match(/^\/api\/ticker\/([A-Za-z.\-]+)$/);
