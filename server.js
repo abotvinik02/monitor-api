@@ -1,9 +1,9 @@
-// Weekly Monitor API — SINGLE-FILE bundle (no lib/ folder needed). Start: node server.js
+// Weekly Monitor API — SINGLE-FILE bundle. Start: node server.js
 import http from 'node:http';
 
 /* UNIVERSE */
 // Categorized watchlist. Add/remove tickers here; the engine scores whatever's listed.
-// `lists` a ticker can appear in: own, deep, leaps, para.
+// `lists` a ticker can appear in: own, deep, leaps, para, or 'overall' (Best Overall only).
 const UNIVERSE = [
   { ticker: 'AVGO', name: 'Broadcom',            lists: ['own'] },
   { ticker: 'GOOGL', name: 'Alphabet',           lists: ['own', 'deep'] },
@@ -17,6 +17,19 @@ const UNIVERSE = [
   { ticker: 'MRVL', name: 'Marvell',             lists: ['para'] },
   { ticker: 'VRT',  name: 'Vertiv',              lists: ['para'] },
   { ticker: 'IONQ', name: 'IonQ',                lists: ['para'] },
+  // --- Best Overall pool (ranked into the top 20; not shown in the sub-lists) ---
+  { ticker: 'LLY',  name: 'Eli Lilly',           lists: ['overall'] },
+  { ticker: 'COST', name: 'Costco',              lists: ['overall'] },
+  { ticker: 'V',    name: 'Visa',                lists: ['overall'] },
+  { ticker: 'MA',   name: 'Mastercard',          lists: ['overall'] },
+  { ticker: 'NFLX', name: 'Netflix',             lists: ['overall'] },
+  { ticker: 'ORCL', name: 'Oracle',              lists: ['overall'] },
+  { ticker: 'CRM',  name: 'Salesforce',          lists: ['overall'] },
+  { ticker: 'NOW',  name: 'ServiceNow',          lists: ['overall'] },
+  { ticker: 'PANW', name: 'Palo Alto Networks',  lists: ['overall'] },
+  { ticker: 'ANET', name: 'Arista Networks',     lists: ['overall'] },
+  { ticker: 'ASML', name: 'ASML Holding',        lists: ['overall'] },
+  { ticker: 'JPM',  name: 'JPMorgan Chase',      lists: ['overall'] },
 ];
 const LISTS = ['own', 'deep', 'leaps', 'para'];
 const tickersFor = (list) => UNIVERSE.filter(u => u.lists.includes(list));
@@ -444,11 +457,10 @@ async function buildAll() {
     const rows = tickersFor(list).map(u => raw.get(u.ticker));
     lists[list] = scoreUniverse(rows, list);
   }
-  // "Best Overall" = top composite across lists (note: cross-list curves differ — shown for convenience)
-  const overall = Object.values(lists).flat()
-    .sort((a, b) => (b.composite ?? -1) - (a.composite ?? -1))
-    .filter((v, i, arr) => arr.findIndex(x => x.ticker === v.ticker) === i)
-    .slice(0, 12);
+  // "Best Overall" = engine-ranked top 20 across the ENTIRE universe (incl. overall-only names).
+  const seenO = new Set(); const pool = [];
+  for (const u of UNIVERSE) { if (!seenO.has(u.ticker)) { seenO.add(u.ticker); pool.push(scoreTicker(raw.get(u.ticker), 'own')); } }
+  const overall = pool.sort((a, b) => (b.composite ?? -1) - (a.composite ?? -1)).slice(0, 20);
 
   // ---- Thesis layer: one batched Claude call (or deterministic fallback)
   const uniq = []; const seen = new Set();
