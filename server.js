@@ -238,6 +238,16 @@ const FH  = 'https://finnhub.io/api/v1';
 
 const num = (v) => (v == null || isNaN(+v) ? null : +v);
 
+// --- compute technicals from a most-recent-first array of closes ---
+function smaN(closes, n) { if (!closes || closes.length < n) return null; let s = 0; for (let i = 0; i < n; i++) s += closes[i]; return s / n; }
+function rsi14(closes) {
+  const n = 14; if (!closes || closes.length < n + 1) return null;
+  let gains = 0, losses = 0;
+  for (let i = 0; i < n; i++) { const diff = closes[i] - closes[i + 1]; if (diff >= 0) gains += diff; else losses -= diff; }
+  const avgL = losses / n; if (avgL === 0) return 100;
+  const rs = (gains / n) / avgL; return 100 - 100 / (1 + rs);
+}
+
 async function j(url) {
   const r = await fetch(url);
   if (!r.ok) throw new Error(`${r.status} ${url.split('?')[0]}`);
@@ -278,13 +288,23 @@ async function fetchTicker(meta) {
       } catch {}
       try { const pt = await j(`${FH}/stock/price-target?symbol=${ticker}&token=${fhKey}`); out.targetMean = num(pt.targetMean); } catch {}
     }
-    // ---- FMP: profile (mktCap, pe), DCF, SMA50/200, RSI, 52w low (support proxy), price target consensus
+    // ---- FMP: profile (mktCap, pe), DCF, price history -> computed SMA/RSI/support, target consensus
     if (fmpKey) {
       try { const p = (await j(`${FMP}/profile/${ticker}?apikey=${fmpKey}`))[0]; if (p) { out.price = out.price ?? num(p.price); out.marketCap = num(p.mktCap); out.pe = num(p.pe); out.name = name || p.companyName; out.support = out.support ?? num(p['range'] ? p.range.split('-')[0] : null); } } catch {}
       try { const dcf = (await j(`${FMP}/discounted-cash-flow/${ticker}?apikey=${fmpKey}`))[0]; if (dcf) out.dcf = num(dcf.dcf); } catch {}
-      try { const s50 = await j(`${FMP}/technical_indicator/1day/${ticker}?type=sma&period=50&apikey=${fmpKey}`);  out.sma50  = num(s50?.[0]?.sma); } catch {}
-      try { const s200= await j(`${FMP}/technical_indicator/1day/${ticker}?type=sma&period=200&apikey=${fmpKey}`); out.sma200 = num(s200?.[0]?.sma); } catch {}
-      try { const rsi = await j(`${FMP}/technical_indicator/1day/${ticker}?type=rsi&period=14&apikey=${fmpKey}`);  out.rsi    = num(rsi?.[0]?.rsi); } catch {}
+      // ONE history call -> compute everything (more reliable + fewer calls than FMP's indicator endpoints)
+      try {
+        const hres = await j(`${FMP}/historical-price-full/${ticker}?timeseries=260&apikey=${fmpKey}`);
+        const hist = Array.isArray(hres?.historical) ? hres.historical : [];
+        if (hist.length) {
+          const closes = hist.map(h => num(h.close)).filter(x => x != null); // most-recent first
+          const lows   = hist.slice(0, 40).map(h => num(h.low ?? h.close)).filter(x => x != null);
+          out.sma50  = out.sma50  ?? smaN(closes, 50);
+          out.sma200 = out.sma200 ?? smaN(closes, 200);
+          out.rsi    = out.rsi    ?? rsi14(closes);
+          if (lows.length) out.support = out.support ?? Math.min(...lows);
+        }
+      } catch {}
       try { if (out.targetMean == null) { const ptc = (await j(`${FMP}/price-target-consensus/${ticker}?apikey=${fmpKey}`))[0]; out.targetMean = num(ptc?.targetConsensus); } } catch {}
     }
   } catch (e) { out._error = String(e.message || e); }
