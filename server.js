@@ -74,15 +74,17 @@ function valueScore(d) {
 // TREND: the guardrail the historical evidence said was missing.
 // Above the 200-DMA = constructive; below = don't "buy support", wait to reclaim.
 function trendScore(d) {
-  if (!d.price || !d.sma200) return { score: null, above200: null };
-  const above200 = d.price >= d.sma200;
-  const above50  = d.sma50 ? d.price >= d.sma50 : null;
-  const golden   = (d.sma50 && d.sma200) ? d.sma50 >= d.sma200 : null; // 50>200
+  const anchor = d.sma200 != null ? d.sma200 : (d.sma50 != null ? d.sma50 : null);
+  if (!d.price || anchor == null) return { score: null, above200: null };
+  const longRef = d.sma200 != null;            // true = real 200-DMA; false = using 50-DMA proxy
+  const above200 = d.price >= anchor;          // "above its trend line"
+  const above50  = d.sma50 != null ? d.price >= d.sma50 : null;
+  const golden   = (d.sma50 != null && d.sma200 != null) ? d.sma50 >= d.sma200 : null;
   let s = above200 ? 70 : 25;
   if (golden === true) s += 15; else if (golden === false) s -= 10;
   if (above50 === true) s += 10; else if (above50 === false) s -= 5;
-  // distance above 200 rewarded mildly (room), but extreme extension not here (that's entry)
-  return { score: clamp(s), above200, above50, golden };
+  if (!longRef) s -= 4;                         // mild penalty for the shorter proxy
+  return { score: clamp(s), above200, above50, golden, longRef };
 }
 
 // ENTRY/TIMING: best when near support, RSI not hot, not over-extended above 50-DMA.
@@ -132,15 +134,16 @@ function letter(composite, curve) {
 
 // SIGNAL: never "buy support" in a downtrend — that's the documented failure mode.
 function signal(d, t) {
-  const haveTech = d.price && d.sma200 && d.rsi != null;
+  const anchor = d.sma200 != null ? d.sma200 : (d.sma50 != null ? d.sma50 : null);
+  const haveTech = d.price && anchor != null && d.rsi != null;
   if (!haveTech) return 'VERIFY';
-  const above200 = d.price >= d.sma200;
+  const aboveTrend = d.price >= anchor;
   const distSup  = d.support ? pct(d.price, d.support) : null;
   const hot      = d.rsi >= 66;
   const ext      = d.sma50 ? pct(d.price, d.sma50) >= 0.12 : false;
 
-  if (!above200) return 'CONFIRM';                  // downtrend: wait for reclaim, don't catch the knife
-  if (distSup != null && distSup < 0)  return 'CONFIRM'; // below support though above 200 -> needs to hold
+  if (!aboveTrend) return 'CONFIRM';                // below trend: wait for reclaim, don't catch the knife
+  if (distSup != null && distSup < 0)  return 'CONFIRM'; // below support though above trend -> needs to hold
   if (distSup != null && distSup <= 0.025 && !hot) return 'BUY'; // at support, uptrend, not hot
   if (hot || ext) return 'WAIT';                    // extended/overbought
   return t.composite >= 74 ? 'BUY' : 'WAIT';
@@ -294,7 +297,7 @@ async function fetchTicker(meta) {
       try { const dcf = (await j(`${FMP}/discounted-cash-flow/${ticker}?apikey=${fmpKey}`))[0]; if (dcf) out.dcf = num(dcf.dcf); } catch {}
       // ONE history call -> compute everything (more reliable + fewer calls than FMP's indicator endpoints)
       try {
-        const hres = await j(`${FMP}/historical-price-full/${ticker}?timeseries=260&apikey=${fmpKey}`);
+        const hres = await j(`${FMP}/historical-price-full/${ticker}?timeseries=400&apikey=${fmpKey}`);
         const hist = Array.isArray(hres?.historical) ? hres.historical : [];
         if (hist.length) {
           const closes = hist.map(h => num(h.close)).filter(x => x != null); // most-recent first
@@ -306,6 +309,28 @@ async function fetchTicker(meta) {
         }
       } catch {}
       try { if (out.targetMean == null) { const ptc = (await j(`${FMP}/price-target-consensus/${ticker}?apikey=${fmpKey}`))[0]; out.targetMean = num(ptc?.targetConsensus); } } catch {}
+    }
+
+    // ---- Fallback history (Stooq, free + keyless, full daily history) when the 200-day is still missing
+    if (out.sma200 == null) {
+      try {
+        const r = await fetch(`https://stooq.com/q/d/l/?s=${ticker.toLowerCase()}.us&i=d`);
+        const txt = await r.text();
+        const rows = txt.trim().split('\n').slice(1)
+          .map(line => { const c = line.split(','); return { date: c[0], close: num(c[4]), low: num(c[3]) }; })
+          .filter(x => x.close != null && x.date)
+          .sort((a, b) => (a.date < b.date ? -1 : 1));        // oldest -> newest
+        if (rows.length >= 50) {
+          const closesDesc = rows.map(x => x.close).reverse(); // most-recent first
+          const lowsDesc   = rows.map(x => x.low ?? x.close).reverse();
+          out.sma50  = out.sma50  ?? smaN(closesDesc, 50);
+          out.sma200 = out.sma200 ?? smaN(closesDesc, 200);
+          out.rsi    = out.rsi    ?? rsi14(closesDesc);
+          const rl = lowsDesc.slice(0, 40).filter(x => x != null);
+          if (rl.length) out.support = out.support ?? Math.min(...rl);
+          if (out.price == null) out.price = closesDesc[0];
+        }
+      } catch {}
     }
   } catch (e) { out._error = String(e.message || e); }
   return out;
@@ -331,7 +356,7 @@ function fallbackThesis(r) {
   const atSupport = dist != null && dist >= 0 && dist <= 0.03;
 
   if (r.signal === 'CONFIRM')
-    return `Below its 200-day line — wait for a reclaim before adding${up > 0 ? `; ${upTxt} if it turns` : ''}.`;
+    return `Below its trend line — wait for a reclaim before adding${up > 0 ? `; ${upTxt} if it turns` : ''}.`;
   if (r.signal === 'BUY')
     return atSupport
       ? `At support in an uptrend, RSI ${rsi}${up > 0 ? ` — ${upTxt}` : ''}.`
