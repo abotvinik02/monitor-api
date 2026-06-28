@@ -250,6 +250,18 @@ function rsi14(closes) {
   const avgL = losses / n; if (avgL === 0) return 100;
   const rs = (gains / n) / avgL; return 100 - 100 / (1 + rs);
 }
+// closesDesc / lowsDesc are most-recent-first; fills sma/rsi/support. Returns true if sma200 obtained.
+function applyHist(out, closesDesc, lowsDesc) {
+  const c = (closesDesc || []).filter(x => x != null);
+  if (c.length < 30) return false;
+  out.sma50  = out.sma50  ?? smaN(c, 50);
+  out.sma200 = out.sma200 ?? smaN(c, 200);
+  out.rsi    = out.rsi    ?? rsi14(c);
+  const lows = (lowsDesc || []).filter(x => x != null).slice(0, 40);
+  if (lows.length) out.support = out.support ?? Math.min(...lows);
+  if (out.price == null) out.price = c[0];
+  return out.sma200 != null;
+}
 
 async function j(url) {
   const r = await fetch(url);
@@ -291,47 +303,56 @@ async function fetchTicker(meta) {
       } catch {}
       try { const pt = await j(`${FH}/stock/price-target?symbol=${ticker}&token=${fhKey}`); out.targetMean = num(pt.targetMean); } catch {}
     }
-    // ---- FMP: profile (mktCap, pe), DCF, price history -> computed SMA/RSI/support, target consensus
+    // ---- FMP: profile (mktCap, pe), DCF, target consensus (no history here — handled below)
     if (fmpKey) {
       try { const p = (await j(`${FMP}/profile/${ticker}?apikey=${fmpKey}`))[0]; if (p) { out.price = out.price ?? num(p.price); out.marketCap = num(p.mktCap); out.pe = num(p.pe); out.name = name || p.companyName; out.support = out.support ?? num(p['range'] ? p.range.split('-')[0] : null); } } catch {}
       try { const dcf = (await j(`${FMP}/discounted-cash-flow/${ticker}?apikey=${fmpKey}`))[0]; if (dcf) out.dcf = num(dcf.dcf); } catch {}
-      // ONE history call -> compute everything (more reliable + fewer calls than FMP's indicator endpoints)
+      try { if (out.targetMean == null) { const ptc = (await j(`${FMP}/price-target-consensus/${ticker}?apikey=${fmpKey}`))[0]; out.targetMean = num(ptc?.targetConsensus); } } catch {}
+    }
+
+    // ---- Price history -> SMA50/200, RSI, support. Source cascade: Yahoo -> FMP -> Stooq.
+    const UA = { headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'accept': 'application/json,text/csv,text/plain,*/*' } };
+    // 1) Yahoo Finance chart (free, keyless, reliable from servers)
+    if (out.sma200 == null) {
+      try {
+        const yr = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`, UA);
+        const yj = await yr.json();
+        const r0 = yj?.chart?.result?.[0]; const q0 = r0?.indicators?.quote?.[0];
+        if (q0 && Array.isArray(q0.close)) {
+          const closesDesc = q0.close.slice().reverse();
+          const lowsDesc   = (q0.low || q0.close).slice().reverse();
+          if (applyHist(out, closesDesc, lowsDesc)) out.histSrc = 'yahoo';
+        }
+      } catch {}
+    }
+    // 2) FMP historical
+    if (out.sma200 == null && fmpKey) {
       try {
         const hres = await j(`${FMP}/historical-price-full/${ticker}?timeseries=400&apikey=${fmpKey}`);
         const hist = Array.isArray(hres?.historical) ? hres.historical : [];
         if (hist.length) {
-          const closes = hist.map(h => num(h.close)).filter(x => x != null); // most-recent first
-          const lows   = hist.slice(0, 40).map(h => num(h.low ?? h.close)).filter(x => x != null);
-          out.sma50  = out.sma50  ?? smaN(closes, 50);
-          out.sma200 = out.sma200 ?? smaN(closes, 200);
-          out.rsi    = out.rsi    ?? rsi14(closes);
-          if (lows.length) out.support = out.support ?? Math.min(...lows);
+          const closesDesc = hist.map(h => num(h.close));   // FMP = most-recent first
+          const lowsDesc   = hist.map(h => num(h.low ?? h.close));
+          if (applyHist(out, closesDesc, lowsDesc)) out.histSrc = 'fmp';
         }
       } catch {}
-      try { if (out.targetMean == null) { const ptc = (await j(`${FMP}/price-target-consensus/${ticker}?apikey=${fmpKey}`))[0]; out.targetMean = num(ptc?.targetConsensus); } } catch {}
     }
-
-    // ---- Fallback history (Stooq, free + keyless, full daily history) when the 200-day is still missing
+    // 3) Stooq CSV
     if (out.sma200 == null) {
       try {
-        const r = await fetch(`https://stooq.com/q/d/l/?s=${ticker.toLowerCase()}.us&i=d`);
+        const r = await fetch(`https://stooq.com/q/d/l/?s=${ticker.toLowerCase()}.us&i=d`, UA);
         const txt = await r.text();
         const rows = txt.trim().split('\n').slice(1)
           .map(line => { const c = line.split(','); return { date: c[0], close: num(c[4]), low: num(c[3]) }; })
-          .filter(x => x.close != null && x.date)
-          .sort((a, b) => (a.date < b.date ? -1 : 1));        // oldest -> newest
+          .filter(x => x.close != null && x.date).sort((a, b) => (a.date < b.date ? -1 : 1));
         if (rows.length >= 50) {
-          const closesDesc = rows.map(x => x.close).reverse(); // most-recent first
+          const closesDesc = rows.map(x => x.close).reverse();
           const lowsDesc   = rows.map(x => x.low ?? x.close).reverse();
-          out.sma50  = out.sma50  ?? smaN(closesDesc, 50);
-          out.sma200 = out.sma200 ?? smaN(closesDesc, 200);
-          out.rsi    = out.rsi    ?? rsi14(closesDesc);
-          const rl = lowsDesc.slice(0, 40).filter(x => x != null);
-          if (rl.length) out.support = out.support ?? Math.min(...rl);
-          if (out.price == null) out.price = closesDesc[0];
+          if (applyHist(out, closesDesc, lowsDesc)) out.histSrc = 'stooq';
         }
       } catch {}
     }
+    if (!out.histSrc) out.histSrc = 'none';
   } catch (e) { out._error = String(e.message || e); }
   return out;
 }
@@ -541,6 +562,8 @@ const server = http.createServer(async (req, res) => {
     });
     if (url.pathname === '/api/monitor') return send(res, 200, await buildAll());
     if (url.pathname === '/api/macro') return send(res, 200, await buildMacro());
+    const mRaw = url.pathname.match(/^\/api\/raw\/([A-Za-z.\-]+)$/);
+    if (mRaw) { const sym = mRaw[1].toUpperCase(); const meta = UNIVERSE.find(u => u.ticker === sym) || { ticker: sym, name: sym }; return send(res, 200, await fetchTicker(meta)); }
     const mList = url.pathname.match(/^\/api\/list\/(\w+)$/);
     if (mList) { const all = await buildAll(); const l = mList[1]; return l in all.lists ? send(res, 200, { list: l, rows: all.lists[l], asof: all.asof }) : send(res, 404, { error: 'unknown list' }); }
     const mTk = url.pathname.match(/^\/api\/ticker\/([A-Za-z.\-]+)$/);
