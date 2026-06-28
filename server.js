@@ -295,8 +295,7 @@ async function fetchTicker(meta) {
   try {
     // ---- Finnhub: live quote + recommendation trends + price target
     if (fhKey) {
-      const q = await j(`${FH}/quote?symbol=${ticker}&token=${fhKey}`);
-      out.price = num(q.c);
+      try { const q = await j(`${FH}/quote?symbol=${ticker}&token=${fhKey}`); out.price = num(q.c) || out.price; } catch {}
       try {
         const rec = (await j(`${FH}/stock/recommendation?symbol=${ticker}&token=${fhKey}`))[0];
         if (rec) { out.ratingBuy = (rec.strongBuy||0)+(rec.buy||0); out.ratingHold = rec.hold||0; out.ratingSell = (rec.sell||0)+(rec.strongSell||0); }
