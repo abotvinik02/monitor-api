@@ -64,11 +64,18 @@ function valueScore(d) {
   const aUp = (d.targetMean && d.price) ? pct(d.targetMean, d.price) : null;   // analyst
   const dUp = (d.dcf && d.price)        ? pct(d.dcf, d.price)        : null;   // intrinsic
   const ups = [aUp, dUp].filter(v => v != null);
-  if (!ups.length) return { score: null, aUp, dUp };
-  const blend = ups.reduce((s, v) => s + v, 0) / ups.length;
-  // map: -20% -> 0, 0% -> 35, +25% -> 75, +50%+ -> 100  (diminishing)
-  const score = clamp(35 + blend * 160);
-  return { score, aUp, dUp, blend };
+  if (ups.length) {
+    const blend = ups.reduce((s, v) => s + v, 0) / ups.length;
+    // map: -20% -> 0, 0% -> 35, +25% -> 75, +50%+ -> 100  (diminishing)
+    return { score: clamp(35 + blend * 160), aUp, dUp, blend, rewardSrc: aUp != null ? 'target' : 'dcf' };
+  }
+  // Fallback when neither analyst target nor DCF is available (common on free data tiers):
+  // estimate reward as a discounted distance back to the 52-week high.
+  if (d.high52 && d.price && d.high52 > d.price) {
+    const hUp = pct(d.high52, d.price) * 0.6;   // 60% of the gap-to-high as a conservative reward proxy
+    return { score: clamp(35 + hUp * 160), aUp: null, dUp: null, blend: hUp, rewardSrc: '52w-high' };
+  }
+  return { score: null, aUp, dUp };
 }
 
 // TREND: the guardrail the historical evidence said was missing.
@@ -213,9 +220,11 @@ function scoreTicker(d, list = 'own') {
     detail: {
       analystUpsidePct: val.aUp == null ? null : +(val.aUp * 100).toFixed(1),
       dcfUpsidePct:     val.dUp == null ? null : +(val.dUp * 100).toFixed(1),
+      upsidePct:        val.blend == null ? null : +(val.blend * 100).toFixed(1),
+      rewardSrc:        val.rewardSrc || null,
       consensus: ra.consensus, ratingNet: ra.net == null ? null : +ra.net.toFixed(2),
       above200: tr.above200, golden: tr.golden, rsi: d.rsi ?? null,
-      support: d.support ?? null, sma50: d.sma50 ?? null, sma200: d.sma200 ?? null,
+      support: d.support ?? null, sma50: d.sma50 ?? null, sma200: d.sma200 ?? null, high52: d.high52 ?? null,
       rewardRisk: rr.ratio == null ? null : +rr.ratio.toFixed(2), rrNote: rr.note,
       pe: d.pe ?? null,
     },
@@ -259,6 +268,8 @@ function applyHist(out, closesDesc, lowsDesc) {
   out.rsi    = out.rsi    ?? rsi14(c);
   const lows = (lowsDesc || []).filter(x => x != null).slice(0, 40);
   if (lows.length) out.support = out.support ?? Math.min(...lows);
+  const yr = c.slice(0, 252);                       // ~52 weeks of closes
+  if (yr.length) out.high52 = out.high52 ?? Math.max(...yr);
   if (out.price == null) out.price = c[0];
   return out.sma200 != null;
 }
