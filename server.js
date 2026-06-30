@@ -328,6 +328,7 @@ async function fetchTicker(meta) {
         const yr = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`, UA);
         const yj = await yr.json();
         const r0 = yj?.chart?.result?.[0]; const q0 = r0?.indicators?.quote?.[0];
+        if (r0?.meta?.regularMarketPrice != null) out.price = out.price ?? num(r0.meta.regularMarketPrice);
         if (q0 && Array.isArray(q0.close)) {
           const closesDesc = q0.close.slice().reverse();
           const lowsDesc   = (q0.low || q0.close).slice().reverse();
