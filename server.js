@@ -450,7 +450,7 @@ function fallbackMacro() {
   return {
     source: 'fallback',
     asof: todayLabel(),
-    regime: 'Live macro commentary is off. Set ANTHROPIC_API_KEY on the backend to get a daily written market read here. Your prices and grades still update from the data feed.',
+    regime: "Today's market read is being generated from live news \u2014 check back in a moment. (Prices and grades update independently and are unaffected.)",
     tape: [], drivers: [], readthrough: '',
   };
 }
@@ -513,12 +513,28 @@ const fresh = (k) => { const c = cache.get(k); return c && (Date.now() - c.ts < 
 const put   = (k, data) => { cache.set(k, { ts: Date.now(), data }); return data; };
 
 const MACRO_TTL = (+(process.env.MACRO_TTL_MIN || 360)) * 60 * 1000; // default 6h
-async function buildMacro() {
+let _macroRefreshing = false;
+function refreshMacroBg() {
+  if (_macroRefreshing) return;
+  _macroRefreshing = true;
+  writeMacro()
+    .then(data => {
+      const ttl = (data && data.source === 'claude') ? MACRO_TTL : 10 * 60 * 1000; // retry fallback in 10 min
+      cache.set('macro', { ts: Date.now(), data, ttl });
+    })
+    .catch(() => {})
+    .finally(() => { _macroRefreshing = false; });
+}
+// Never blocks the request: serve the last good macro instantly; refresh in the background when stale.
+function buildMacro() {
   const c = cache.get('macro');
-  if (c && (Date.now() - c.ts < MACRO_TTL)) return c.data;
-  const data = await writeMacro();
-  cache.set('macro', { ts: Date.now(), data });
-  return data;
+  if (c) {
+    const ttl = c.ttl || MACRO_TTL;
+    if (Date.now() - c.ts >= ttl) refreshMacroBg();
+    return c.data;
+  }
+  refreshMacroBg();         // nothing cached yet -> kick off generation
+  return fallbackMacro();   // and return a fast placeholder this once
 }
 
 // fetch every ticker once (throttled), score per list it belongs to
@@ -572,7 +588,7 @@ const server = http.createServer(async (req, res) => {
       signalRule: 'below 200-DMA -> CONFIRM (never "buy support" in a downtrend); at support + uptrend + not hot -> BUY; extended/overbought -> WAIT; thin data -> VERIFY',
     });
     if (url.pathname === '/api/monitor') return send(res, 200, await buildAll());
-    if (url.pathname === '/api/macro') return send(res, 200, await buildMacro());
+    if (url.pathname === "/api/macro") return send(res, 200, buildMacro());
     const mRaw = url.pathname.match(/^\/api\/raw\/([A-Za-z.\-]+)$/);
     if (mRaw) { const sym = mRaw[1].toUpperCase(); const meta = UNIVERSE.find(u => u.ticker === sym) || { ticker: sym, name: sym }; return send(res, 200, await fetchTicker(meta)); }
     const mList = url.pathname.match(/^\/api\/list\/(\w+)$/);
@@ -585,4 +601,4 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => console.log(`Weekly Monitor API on :${PORT}  (mock=${isMock()})`));
+server.listen(PORT, () => { console.log(`Weekly Monitor API on :${PORT}  (mock=${isMock()})`); try { refreshMacroBg(); } catch {} });
