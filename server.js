@@ -49,10 +49,10 @@ const pct = (a, b) => (b ? (a - b) / b : 0);
 // ---- Per-list weighting & curve. Each list grades on its own curve, on purpose.
 // weights must sum to ~1. curve shifts the letter mapping (looser/stricter).
 const LIST_PROFILE = {
-  own:   { w: { value: 0.30, trend: 0.25, entry: 0.20, rating: 0.25 }, curve:  0 },
-  deep:  { w: { value: 0.45, trend: 0.20, entry: 0.15, rating: 0.20 }, curve: +3 }, // value-led
-  leaps: { w: { value: 0.30, trend: 0.30, entry: 0.25, rating: 0.15 }, curve:  0 }, // trend+timing matter
-  para:  { w: { value: 0.40, trend: 0.20, entry: 0.20, rating: 0.20 }, curve: +8 }, // looser curve, asymmetry hunt
+  own:   { w: { value: 0.25, trend: 0.22, entry: 0.18, rating: 0.18, quality: 0.17 }, curve:  0 },
+  deep:  { w: { value: 0.40, trend: 0.18, entry: 0.12, rating: 0.15, quality: 0.15 }, curve: +3 }, // value-led
+  leaps: { w: { value: 0.28, trend: 0.28, entry: 0.22, rating: 0.12, quality: 0.10 }, curve:  0 }, // trend+timing matter
+  para:  { w: { value: 0.38, trend: 0.18, entry: 0.18, rating: 0.16, quality: 0.10 }, curve: +8 }, // looser curve, asymmetry hunt
 };
 
 // ---------------------------------------------------------------------------
@@ -189,14 +189,25 @@ function rewardRisk(d, t) {
 // ---------------------------------------------------------------------------
 //  MAIN
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Quality/health: returns on capital + balance-sheet strength + cash generation.
+function qualityScore(d) {
+  const parts = [];
+  if (d.roic != null)          parts.push({ w: 0.40, s: clamp(d.roic * 100 * 3.5 + 15) });              // ROIC: 20%->85, 10%->50
+  if (d.netDebtEbitda != null) { const nd = d.netDebtEbitda; const s = nd < 0 ? 100 : nd < 1 ? 85 : nd < 2 ? 68 : nd < 3 ? 50 : nd < 4 ? 35 : nd < 5 ? 22 : 10; parts.push({ w: 0.35, s }); }
+  if (d.fcfYield != null)      parts.push({ w: 0.25, s: clamp(d.fcfYield * 100 * 8 + 40) });             // FCF yield: 5%->80
+  if (!parts.length) return { score: null };
+  const wsum = parts.reduce((a, p) => a + p.w, 0);
+  return { score: parts.reduce((a, p) => a + p.s * p.w, 0) / wsum };
+}
 function scoreTicker(d, list = 'own') {
   const profile = LIST_PROFILE[list] || LIST_PROFILE.own;
-  const val = valueScore(d), tr = trendScore(d), en = entryScore(d), ra = ratingScore(d);
+  const val = valueScore(d), tr = trendScore(d), en = entryScore(d), ra = ratingScore(d), qu = qualityScore(d);
 
   // weighted composite over available components (renormalize weights for missing data)
-  const parts = [['value', val.score], ['trend', tr.score], ['entry', en.score], ['rating', ra.score]];
+  const parts = [['value', val.score], ['trend', tr.score], ['entry', en.score], ['rating', ra.score], ['quality', qu.score]];
   let wsum = 0, acc = 0, have = 0;
-  for (const [k, s] of parts) { if (s != null) { acc += s * profile.w[k]; wsum += profile.w[k]; have++; } }
+  for (const [k, s] of parts) { if (s != null && profile.w[k] != null) { acc += s * profile.w[k]; wsum += profile.w[k]; have++; } }
   const composite = wsum ? acc / wsum : null;
 
   const t = { list, composite, val, tr, en, ra };
@@ -204,7 +215,7 @@ function scoreTicker(d, list = 'own') {
   const sig    = signal(d, t);
   const size   = sizing(d, t);
   const rr     = rewardRisk(d, t);
-  const confidence = Math.round((have / 4) * 100); // % of inputs present
+  const confidence = Math.round((have / 5) * 100); // % of inputs present
 
   return {
     ticker: d.ticker, name: d.name, list,
@@ -216,6 +227,7 @@ function scoreTicker(d, list = 'own') {
       trend: tr.score == null ? null : Math.round(tr.score),
       entry: en.score == null ? null : Math.round(en.score),
       rating: ra.score == null ? null : Math.round(ra.score),
+      quality: qu.score == null ? null : Math.round(qu.score),
     },
     detail: {
       analystUpsidePct: val.aUp == null ? null : +(val.aUp * 100).toFixed(1),
@@ -227,6 +239,8 @@ function scoreTicker(d, list = 'own') {
       support: d.support ?? null, sma50: d.sma50 ?? null, sma200: d.sma200 ?? null, high52: d.high52 ?? null,
       rewardRisk: rr.ratio == null ? null : +rr.ratio.toFixed(2), rrNote: rr.note,
       pe: d.pe ?? null,
+      roic: d.roic!=null ? +(d.roic*100).toFixed(1) : null, netDebtEbitda: d.netDebtEbitda ?? null, fcfYield: d.fcfYield!=null ? +(d.fcfYield*100).toFixed(1) : null,
+      qualityScore: qu.score==null?null:Math.round(qu.score),
     },
     confidence,
     asof: new Date().toISOString(),
@@ -296,6 +310,48 @@ const MOCK = {
   IONQ: { price: 38,  sma50: 42,  sma200: 33,  rsi: 48, support: 32,  targetMean: 55,  dcf: 20,  pe: null, marketCap: 9e9, ratingBuy: 6, ratingHold: 3, ratingSell: 2 },
 };
 function isMock() { return process.env.MOCK === '1' || (!process.env.FMP_KEY && !process.env.FINNHUB_KEY); }
+
+// Reusable raw daily history (chronological, oldest->newest). Yahoo -> FMP -> Stooq. Used by the backtest.
+async function fetchSeries(ticker) {
+  const UA = { headers: { 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36', 'accept': 'application/json,text/csv,text/plain,*/*' } };
+  const FMP = 'https://financialmodelingprep.com/api/v3';
+  const fmpKey = process.env.FMP_KEY;
+  const numL = (v) => (v == null || isNaN(+v) ? null : +v);
+  // 1) Yahoo
+  try {
+    const yr = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=5y&interval=1d`, UA);
+    const yj = await yr.json();
+    const q0 = yj?.chart?.result?.[0]?.indicators?.quote?.[0];
+    if (q0 && Array.isArray(q0.close)) {
+      const closesAsc = q0.close.map(numL);
+      const lowsAsc = (q0.low || q0.close).map(numL);
+      // strip trailing/leading nulls pairwise
+      const cA = [], lA = [];
+      for (let i = 0; i < closesAsc.length; i++) { if (closesAsc[i] != null) { cA.push(closesAsc[i]); lA.push(lowsAsc[i] ?? closesAsc[i]); } }
+      if (cA.length >= 260) return { closesAsc: cA, lowsAsc: lA, src: 'yahoo' };
+    }
+  } catch {}
+  // 2) FMP
+  if (fmpKey) {
+    try {
+      const hres = await (await fetch(`${FMP}/historical-price-full/${ticker}?timeseries=1300&apikey=${fmpKey}`, UA)).json();
+      const hist = Array.isArray(hres?.historical) ? hres.historical : [];
+      if (hist.length >= 260) {
+        const asc = hist.slice().reverse();
+        return { closesAsc: asc.map(h => numL(h.close)), lowsAsc: asc.map(h => numL(h.low ?? h.close)), src: 'fmp' };
+      }
+    } catch {}
+  }
+  // 3) Stooq
+  try {
+    const txt = await (await fetch(`https://stooq.com/q/d/l/?s=${ticker.toLowerCase()}.us&i=d`, UA)).text();
+    const rows = txt.trim().split('\n').slice(1)
+      .map(line => { const c = line.split(','); return { date: c[0], close: numL(c[4]), low: numL(c[3]) }; })
+      .filter(x => x.close != null && x.date).sort((a, b) => (a.date < b.date ? -1 : 1));
+    if (rows.length >= 260) return { closesAsc: rows.map(x => x.close), lowsAsc: rows.map(x => x.low ?? x.close), src: 'stooq' };
+  } catch {}
+  return null;
+}
 async function fetchTicker(meta) {
   const { ticker, name } = meta;
   if (isMock()) return { ticker, name, ...(MOCK[ticker] || {}) };
@@ -318,6 +374,7 @@ async function fetchTicker(meta) {
       try { const p = (await j(`${FMP}/profile/${ticker}?apikey=${fmpKey}`))[0]; if (p) { out.price = out.price ?? num(p.price); out.marketCap = num(p.mktCap); out.pe = num(p.pe); out.name = name || p.companyName; out.support = out.support ?? num(p['range'] ? p.range.split('-')[0] : null); } } catch {}
       try { const dcf = (await j(`${FMP}/discounted-cash-flow/${ticker}?apikey=${fmpKey}`))[0]; if (dcf) out.dcf = num(dcf.dcf); } catch {}
       try { if (out.targetMean == null) { const ptc = (await j(`${FMP}/price-target-consensus/${ticker}?apikey=${fmpKey}`))[0]; out.targetMean = num(ptc?.targetConsensus); } } catch {}
+      try { const km = (await j(`${FMP}/key-metrics-ttm/${ticker}?apikey=${fmpKey}`))[0]; if (km) { out.roic = num(km.roicTTM); out.netDebtEbitda = num(km.netDebtToEBITDATTM); out.fcfYield = num(km.freeCashFlowYieldTTM); } } catch {}
     }
 
     // ---- Price history -> SMA50/200, RSI, support. Source cascade: Yahoo -> FMP -> Stooq.
@@ -493,6 +550,73 @@ async function writeMacro() {
   }
 }
 
+/* BACKTEST */
+// ============================================================================
+//  BACKTEST — tests the core rule ("buy quality near support IN an uptrend,
+//  not overbought") on each name's own daily history, and measures whether the
+//  signal actually beats simply being invested (the baseline). This is an
+//  honest, simple event-study backtest, not a full portfolio simulation.
+// ============================================================================
+
+
+const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+const med = (a) => { if (!a.length) return null; const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; };
+function smaAt(c, end, n) { if (end + 1 < n) return null; let s = 0; for (let i = end - n + 1; i <= end; i++) s += c[i]; return s / n; }
+function rsiAt(c, end, n = 14) { if (end < n) return null; let g = 0, l = 0; for (let i = end - n + 1; i <= end; i++) { const d = c[i] - c[i - 1]; if (d >= 0) g += d; else l -= d; } const al = l / n; if (al === 0) return 100; return 100 - 100 / (1 + (g / n) / al); }
+async function runBacktest({ hold = 20, supBand = 0.03, rsiCap = 66 } = {}) {
+  const perTicker = [];
+  let allFwd = [], allWin = 0, allSig = 0, baseAll = [];
+
+  for (const u of UNIVERSE) {
+    let series; try { series = await fetchSeries(u.ticker); } catch { series = null; }
+    if (!series || series.closesAsc.length < 260) { perTicker.push({ ticker: u.ticker, signals: 0, note: 'insufficient history' }); continue; }
+    const c = series.closesAsc, lo = series.lowsAsc;
+    const fwd = []; let win = 0; const base = [];
+    for (let t = 200; t < c.length - hold; t++) {
+      base.push((c[t + hold] - c[t]) / c[t]);                 // baseline: forward return of every eligible day
+      const s200 = smaAt(c, t, 200); const rsi = rsiAt(c, t, 14);
+      if (s200 == null || rsi == null) continue;
+      let sup = Infinity; for (let i = Math.max(0, t - 39); i <= t; i++) sup = Math.min(sup, lo[i]);
+      const px = c[t];
+      const aboveTrend = px >= s200;
+      const nearSup = sup > 0 && px >= sup && px <= sup * (1 + supBand);
+      const notHot = rsi < rsiCap;
+      if (aboveTrend && nearSup && notHot) { const f = (c[t + hold] - px) / px; fwd.push(f); if (f > 0) win++; }
+    }
+    const sig = fwd.length;
+    perTicker.push({
+      ticker: u.ticker, signals: sig, src: series.src,
+      winRatePct: sig ? +(win / sig * 100).toFixed(1) : null,
+      avgFwdPct:  sig ? +(avg(fwd) * 100).toFixed(2) : null,
+      baseAvgFwdPct: +(avg(base) * 100).toFixed(2),
+      edgePct: sig ? +((avg(fwd) - avg(base)) * 100).toFixed(2) : null,
+    });
+    allFwd = allFwd.concat(fwd); allWin += win; allSig += sig; baseAll = baseAll.concat(base);
+  }
+
+  return {
+    params: { hold, supBand, rsiCap },
+    asof: new Date().toISOString(),
+    universe: UNIVERSE.length,
+    method: `On each name's daily history: signal = price above 200-DMA AND within ${(supBand*100)}% of its 40-day support AND RSI<${rsiCap}. Measures the ${hold}-trading-day forward return after each signal vs. the average forward return of all days (being invested). Edge = signal return minus baseline.`,
+    aggregate: {
+      signals: allSig,
+      winRatePct: allSig ? +(allWin / allSig * 100).toFixed(1) : null,
+      avgFwdPct: allSig ? +(avg(allFwd) * 100).toFixed(2) : null,
+      medFwdPct: allSig ? +(med(allFwd) * 100).toFixed(2) : null,
+      baselineAvgFwdPct: +(avg(baseAll) * 100).toFixed(2),
+      edgeVsBaselinePct: allSig ? +((avg(allFwd) - avg(baseAll)) * 100).toFixed(2) : null,
+    },
+    perTicker: perTicker.sort((a, b) => (b.edgePct ?? -99) - (a.edgePct ?? -99)),
+    caveats: [
+      'Event study on price history only — not a portfolio sim (no position sizing, cash drag, or overlapping-trade limits).',
+      'Uses current index membership (survivorship bias) and no transaction costs/slippage.',
+      'Fundamentals (targets/DCF) are NOT point-in-time, so the live grade blends factors this price-only test cannot replay.',
+      'A positive edge vs. baseline means the entry timing added value on top of simply owning the name over the window.',
+    ],
+  };
+}
+
 /* SERVER */
 // ============================================================================
 //  Weekly Monitor API — zero-dependency Node server.
@@ -500,6 +624,7 @@ async function writeMacro() {
 //  Run:  node server.js           (MOCK auto-on if no API keys)
 //        FMP_KEY=.. FINNHUB_KEY=.. node server.js   (live)
 // ============================================================================
+
 
 
 
@@ -535,6 +660,18 @@ function buildMacro() {
   }
   refreshMacroBg();         // nothing cached yet -> kick off generation
   return fallbackMacro();   // and return a fast placeholder this once
+}
+
+// --- Backtest: heavy (fetches multi-year history for the whole universe), so run in the background and cache 24h ---
+let _btRunning = false, _btCache = null;
+function buildBacktest(params) {
+  const key = JSON.stringify(params);
+  if (_btCache && _btCache.key === key && Date.now() - _btCache.ts < 24 * 3600 * 1000) return _btCache.data;
+  if (!_btRunning) {
+    _btRunning = true;
+    runBacktest(params).then(d => { _btCache = { ts: Date.now(), key, data: d }; }).catch(() => {}).finally(() => { _btRunning = false; });
+  }
+  return (_btCache && _btCache.key === key) ? _btCache.data : { status: 'computing', note: 'Backtest is running across the full universe — reload in ~20–30 seconds.', params };
 }
 
 // fetch every ticker once (throttled), score per list it belongs to
@@ -589,6 +726,12 @@ const server = http.createServer(async (req, res) => {
     });
     if (url.pathname === '/api/monitor') return send(res, 200, await buildAll());
     if (url.pathname === "/api/macro") return send(res, 200, buildMacro());
+    if (url.pathname === "/api/backtest") {
+      const hold = Math.max(5, Math.min(120, +(url.searchParams.get('hold') || 20)));
+      const band = Math.max(0.01, Math.min(0.15, +(url.searchParams.get('band') || 0.03)));
+      const rsiCap = Math.max(50, Math.min(80, +(url.searchParams.get('rsi') || 66)));
+      return send(res, 200, buildBacktest({ hold, supBand: band, rsiCap }));
+    }
     const mRaw = url.pathname.match(/^\/api\/raw\/([A-Za-z.\-]+)$/);
     if (mRaw) { const sym = mRaw[1].toUpperCase(); const meta = UNIVERSE.find(u => u.ticker === sym) || { ticker: sym, name: sym }; return send(res, 200, await fetchTicker(meta)); }
     const mList = url.pathname.match(/^\/api\/list\/(\w+)$/);
